@@ -1,7 +1,7 @@
-
 import argparse
 import os
 import tempfile
+import shutil
 
 from functools import lru_cache
 from pathlib import Path
@@ -11,6 +11,8 @@ import torch
 
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
+
+from app.genres import to_korean_genres
 
 from . import repository
 from .model import MatrixFactorization
@@ -483,11 +485,19 @@ def load_model():
             "MF 모델이 없습니다. 먼저 학습하세요."
         )
 
-    checkpoint = torch.load(
-        MODEL_PATH,
-        map_location="cpu",
-        weights_only=True,
-    )
+    fd, temp_name = tempfile.mkstemp(suffix=".pt")
+    os.close(fd)
+    temp_path = Path(temp_name)
+
+    try:
+        shutil.copyfile(MODEL_PATH, temp_path)
+        checkpoint = torch.load(
+            temp_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    finally:
+        temp_path.unlink(missing_ok=True)
 
     user_ids = checkpoint["user_ids"].numpy()
     movie_ids = checkpoint["movie_ids"].numpy()
@@ -671,9 +681,8 @@ def get_recommendations(user_id: int):
                 "title",
                 f"영화 {movie_id}",
             ),
-            "genres": info.get(
-                "genres",
-                "",
+            "genres": to_korean_genres(
+                info.get("genres", "")
             ),
             "predicted_rating": round(
                 float(predicted[idx]),

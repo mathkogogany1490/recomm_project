@@ -1,20 +1,29 @@
-import { useQuery } from "@tanstack/react-query";
+import {
+    useQuery,
+} from "@tanstack/react-query";
 
 import {
     getTransformerKpi,
     getTransformerRecommendations,
 } from "../api/transformerApi";
 
+
 export function useTransformerKpi() {
     return useQuery({
-        queryKey: ["transformer", "kpi"],
+        queryKey: [
+            "transformer",
+            "kpi",
+        ],
         queryFn: getTransformerKpi,
-        staleTime: 60000,
-        retry: 1,
+        staleTime: 60 * 1000,
+        retry: false,
     });
 }
 
-export function useTransformerRecommendations(userId) {
+
+export function useTransformerRecommendations(
+    userId
+) {
     return useQuery({
         queryKey: [
             "transformer",
@@ -22,12 +31,12 @@ export function useTransformerRecommendations(userId) {
             userId,
         ],
         queryFn: () =>
-            getTransformerRecommendations(userId),
+            getTransformerRecommendations(
+                userId
+            ),
         enabled:
-            userId !== null &&
-            userId !== undefined &&
-            String(userId).trim() !== "",
-        staleTime: 60000,
-        retry: 1,
+            Number.isInteger(userId) &&
+            userId > 0,
+        retry: false,
     });
 }

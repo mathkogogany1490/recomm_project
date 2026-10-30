@@ -3,7 +3,6 @@ venv
 __pycache__
 *.pyc
 
-checkpoint
 app/data
 
 .env

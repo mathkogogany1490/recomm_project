@@ -1,4 +1,3 @@
-
 import numpy as np
 
 from sqlalchemy import select
@@ -50,6 +49,7 @@ def get_movie_details(movie_ids: list[int]) -> dict:
             select(
                 SvdMovie.movie_id,
                 SvdMovie.title,
+                SvdMovie.genres,
             ).where(
                 SvdMovie.movie_id.in_(movie_ids)
             )
@@ -58,7 +58,7 @@ def get_movie_details(movie_ids: list[int]) -> dict:
         return {
             int(movie_id): {
                 "title": title,
-                "genres": "",
+                "genres": genres or "",
             }
-            for movie_id, title in rows
+            for movie_id, title, genres in rows
         }

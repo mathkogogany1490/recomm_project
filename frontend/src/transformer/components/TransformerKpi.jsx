@@ -1,60 +1,145 @@
+import {
+    Alert,
+    Card,
+    Col,
+    Row,
+    Skeleton,
+    Statistic,
+    Typography,
+} from "antd";
 
-export default function TransformerKpi({ data }) {
-    const metrics = [
-        {
-            label: "평균 제곱 오차 (MSE)",
-            value: data.mse,
-        },
-        {
-            label: "평균 절대 오차 (MAE)",
-            value: data.mae,
-        },
-        {
-            label: "RMSE",
-            value: data.rmse,
-        },
-    ];
+import {
+    useTransformerKpi,
+} from "../query/useTransformer";
+
+import {
+    getApiError,
+} from "../../shared/api/http";
+
+
+export default function TransformerKpi() {
+    const {
+        data,
+        isPending,
+        isError,
+        error,
+    } = useTransformerKpi();
+
+    if (isPending) {
+        return (
+            <Card>
+                <Skeleton active />
+            </Card>
+        );
+    }
+
+    if (isError) {
+        return (
+            <Alert
+                type="error"
+                showIcon
+                title="Transformer KPI 조회 실패"
+                description={getApiError(error)}
+            />
+        );
+    }
 
     return (
-        <div
-            style={{
-                display: "grid",
-                gridTemplateColumns:
-                    "repeat(auto-fit, minmax(180px, 1fr))",
-                gap: 16,
-                marginBottom: 20,
-            }}
-        >
-            {metrics.map((metric) => (
-                <div
-                    key={metric.label}
-                    style={{
-                        padding: 20,
-                        background: "#fff",
-                        border: "1px solid #e2e8f0",
-                        borderRadius: 12,
-                    }}
-                >
-                    <div
-                        style={{
-                            fontSize: 14,
-                            color: "#64748b",
-                        }}
-                    >
-                        {metric.label}
-                    </div>
+        <>
+            <Row gutter={[16, 16]}>
+                <Col xs={24} md={8}>
+                    <Card>
+                        <Statistic
+                            title="평균 절대 오차 (MAE)"
+                            value={data.mae}
+                            precision={6}
+                            valueStyle={{
+                                color: "#1677ff",
+                                fontWeight: 700,
+                            }}
+                        />
 
-                    <div
-                        style={{
-                            marginTop: 10,
-                            fontSize: 28,
-                            fontWeight: 700,
-                        }}
+                        <Typography.Text
+                            type="secondary"
+                        >
+                            실제 평점과 예측 평점의
+                            절대 차이 평균
+                        </Typography.Text>
+                    </Card>
+                </Col>
+
+                <Col xs={24} md={8}>
+                    <Card>
+                        <Statistic
+                            title="평균 제곱 오차 (MSE)"
+                            value={data.mse}
+                            precision={6}
+                            valueStyle={{
+                                color: "#cf1322",
+                                fontWeight: 700,
+                            }}
+                        />
+
+                        <Typography.Text
+                            type="secondary"
+                        >
+                            평점 오차 제곱의 평균
+                        </Typography.Text>
+                    </Card>
+                </Col>
+
+                <Col xs={24} md={8}>
+                    <Card>
+                        <Statistic
+                            title="평균 제곱근 오차 (RMSE)"
+                            value={data.rmse}
+                            precision={6}
+                            valueStyle={{
+                                color: "#389e0d",
+                                fontWeight: 700,
+                            }}
+                        />
+
+                        <Typography.Text
+                            type="secondary"
+                        >
+                            제곱 오차를 평점 단위로 환산
+                        </Typography.Text>
+                    </Card>
+                </Col>
+            </Row>
+
+            <Card
+                style={{
+                    marginTop: 16,
+                }}
+            >
+                <Typography.Text
+                    type="secondary"
+                >
+                    고객{" "}
+                    {data.user_count.toLocaleString()}
+                    명
+                    {" · "}
+                    영화{" "}
+                    {data.movie_count.toLocaleString()}
+                    편
+                    {" · "}
+                    평점{" "}
+                    {data.rating_count.toLocaleString()}
+                    건
+                    {" · "}
+                    {data.epochs}회 학습
+                </Typography.Text>
+
+                <div style={{ marginTop: 8 }}>
+                    <Typography.Text
+                        type="secondary"
                     >
-                        {Number(metric.value).toFixed(4)}
-                    </div>
+                        평가 기준: {data.evaluation}
+                    </Typography.Text>
                 </div>
-            ))}
-        </div>
+            </Card>
+        </>
     );
 }

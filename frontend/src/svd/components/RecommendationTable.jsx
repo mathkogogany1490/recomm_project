@@ -1,4 +1,3 @@
-
 import {
     Alert,
     Card,
@@ -46,6 +45,11 @@ const columns = [
         title: "영화 제목",
         dataIndex: "title",
         key: "title",
+    },
+    {
+        title: "장르",
+        dataIndex: "genres",
+        key: "genres",
     },
     {
         title: "예측 평점",

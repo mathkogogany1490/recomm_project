@@ -39,7 +39,6 @@ const items = [
         key: "/transformer",
         icon: <RobotOutlined />,
         label: "Transformer 추천",
-        disabled: true,
     },
 ];
 

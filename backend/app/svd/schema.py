@@ -1,4 +1,3 @@
-
 from pydantic import BaseModel, Field
 
 
@@ -17,6 +16,7 @@ class SvdRecommendationItem(BaseModel):
     rank: int = Field(ge=1, le=5)
     movie_id: int
     title: str
+    genres: str
     predicted_rating: float
 
 

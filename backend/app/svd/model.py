@@ -1,4 +1,3 @@
-
 from sqlalchemy import BigInteger, Float, ForeignKey, Index, String
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -16,6 +15,11 @@ class SvdMovie(Base):
     title: Mapped[str] = mapped_column(
         String(500),
         nullable=False,
+    )
+
+    genres: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
     )
 
 

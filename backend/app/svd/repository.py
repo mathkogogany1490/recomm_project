@@ -1,4 +1,3 @@
-
 from pathlib import Path
 
 import numpy as np
@@ -194,7 +193,7 @@ def get_seen_movie_ids(user_id: int) -> set[int]:
 
 def get_movie_titles(
     movie_ids: list[int],
-) -> dict[int, str]:
+) -> dict[int, dict]:
 
     if not movie_ids:
         return {}
@@ -204,12 +203,16 @@ def get_movie_titles(
             select(
                 SvdMovie.movie_id,
                 SvdMovie.title,
+                SvdMovie.genres,
             ).where(
                 SvdMovie.movie_id.in_(movie_ids)
             )
         ).all()
 
         return {
-            int(movie_id): title
-            for movie_id, title in rows
+            int(movie_id): {
+                "title": title,
+                "genres": genres or "",
+            }
+            for movie_id, title, genres in rows
         }

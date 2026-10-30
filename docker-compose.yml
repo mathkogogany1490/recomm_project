@@ -81,7 +81,7 @@ services:
 
     expose: ["8000"]
 
-    volumes: ["./backend/checkpoint:/backend/checkpoint:ro"]
+    volumes: ["./backend/checkpoint:/backend/checkpoint"]
 
     depends_on:
       postgres:

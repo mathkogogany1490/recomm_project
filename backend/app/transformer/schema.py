@@ -1,10 +1,9 @@
-
 from pydantic import BaseModel, Field
 
 
 class TransformerKpiResponse(BaseModel):
-    mse: float
     mae: float
+    mse: float
     rmse: float
     rating_count: int
     user_count: int

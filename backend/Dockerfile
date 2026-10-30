@@ -11,10 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
-
-RUN mkdir -p /backend/checkpoint/svd_model \
-    /backend/checkpoint/mf_model \
-    /backend/checkpoint/transformer_model
+COPY checkpoint ./checkpoint
 
 EXPOSE 8000
 

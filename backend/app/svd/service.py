@@ -1,4 +1,3 @@
-
 import argparse
 import os
 import tempfile
@@ -10,6 +9,8 @@ import numpy as np
 
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import svds
+
+from app.genres import to_korean_genres
 
 from . import repository
 
@@ -461,12 +462,17 @@ def get_recommendations(user_id: int):
             movie_ids[idx]
         )
 
+        info = titles.get(movie_id, {})
+
         recommendations.append({
             "rank": rank,
             "movie_id": movie_id,
-            "title": titles.get(
-                movie_id,
+            "title": info.get(
+                "title",
                 f"영화 {movie_id}",
+            ),
+            "genres": to_korean_genres(
+                info.get("genres", "")
             ),
             "predicted_rating": round(
                 float(predicted[idx]),
