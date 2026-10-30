@@ -1,7 +1,40 @@
 
-from sqlalchemy import text
+import logging
+import time
+
+from sqlalchemy import bindparam, text
+from sqlalchemy.exc import OperationalError
 
 from app.database import SessionLocal
+
+
+logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 3
+RETRY_DELAY = 3
+
+
+def _fetch_all(sql, params=None):
+    """DB 연결 오류 시 쿼리 단위로 재시도."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with SessionLocal() as db:
+                return db.execute(
+                    sql, params or {}
+                ).fetchall()
+
+        except OperationalError as exc:
+            logger.warning(
+                "PostgreSQL 오류 (%s/%s): %s",
+                attempt,
+                MAX_RETRIES,
+                exc,
+            )
+
+            if attempt == MAX_RETRIES:
+                raise
+
+            time.sleep(RETRY_DELAY * attempt)
 
 
 # ==========================================
@@ -39,105 +72,123 @@ def get_counts():
 # ==========================================
 
 def get_movie_ids():
-    with SessionLocal() as db:
-        result = db.execute(text("""
-            SELECT movie_id
-            FROM svd_movies
-            ORDER BY movie_id
-        """))
+    rows = _fetch_all(text("""
+        SELECT movie_id
+        FROM svd_movies
+        ORDER BY movie_id
+    """))
 
-        return [
-            int(row.movie_id)
-            for row in result
-        ]
+    return [int(row.movie_id) for row in rows]
 
 
 # ==========================================
 # 3. 고객별 시간순 평점 이력
 # ==========================================
 
-def iter_user_histories(batch_size=50000):
+def iter_user_histories(batch_size=1000):
     """
-    PostgreSQL에서 고객별 영화 평점 이력을
-    시간순으로 스트리밍합니다.
+    사용자 ID 기준 페이지 조회.
 
-    전체 평점 데이터를 메모리에 올리거나
-    고객×영화 피벗을 생성하지 않습니다.
+    - 페이지마다 연결 종료
+    - 고객별 시간순 평점 이력 반환
+    - 기존 반환 형식 유지:
+        yield user_id, [(movie_id, rating), ...]
+
+    주의:
+    학습 중 svd_ratings가 변경되지 않는다는 전제.
     """
 
-    sql = text("""
+    if batch_size < 1:
+        raise ValueError("batch_size는 1 이상이어야 합니다.")
+
+    last_user_id = -1
+
+    user_sql = text("""
+        SELECT DISTINCT user_id
+        FROM svd_ratings
+        WHERE timestamp IS NOT NULL
+          AND user_id > :last_user_id
+        ORDER BY user_id
+        LIMIT :batch_size
+    """)
+
+    history_sql = text("""
         SELECT
             user_id,
             movie_id,
             rating
         FROM svd_ratings
-        WHERE timestamp IS NOT NULL
+        WHERE user_id IN :user_ids
+          AND timestamp IS NOT NULL
         ORDER BY
             user_id,
             timestamp,
             movie_id
-    """).execution_options(
-        stream_results=True,
-        yield_per=batch_size,
+    """).bindparams(
+        bindparam("user_ids", expanding=True)
     )
 
-    with SessionLocal() as db:
-        result = db.execute(sql)
+    while True:
+        user_rows = _fetch_all(
+            user_sql,
+            {
+                "last_user_id": last_user_id,
+                "batch_size": batch_size,
+            },
+        )
 
-        current_user = None
-        history = []
+        if not user_rows:
+            break
 
-        for row in result:
-            user_id = int(row.user_id)
-            movie_id = int(row.movie_id)
-            rating = float(row.rating)
+        user_ids = [
+            int(row.user_id)
+            for row in user_rows
+        ]
 
-            if (
-                current_user is not None
-                and user_id != current_user
-            ):
-                yield current_user, history
-                history = []
+        rows = _fetch_all(
+            history_sql,
+            {"user_ids": user_ids},
+        )
 
-            current_user = user_id
+        histories = {
+            user_id: []
+            for user_id in user_ids
+        }
 
-            history.append((
-                movie_id,
-                rating,
-            ))
+        for row in rows:
+            histories[int(row.user_id)].append(
+                (
+                    int(row.movie_id),
+                    float(row.rating),
+                )
+            )
 
-        if current_user is not None:
-            yield current_user, history
+        for user_id in user_ids:
+            yield user_id, histories[user_id]
+
+        last_user_id = user_ids[-1]
 
 
 # ==========================================
-# 4. 특정 고객의 평점 이력
+# 4. 특정 고객 평점 이력
 # ==========================================
 
 def get_user_history(user_id):
-    with SessionLocal() as db:
-        result = db.execute(
-            text("""
-                SELECT
-                    movie_id,
-                    rating
-                FROM svd_ratings
-                WHERE user_id = :user_id
-                  AND timestamp IS NOT NULL
-                ORDER BY
-                    timestamp,
-                    movie_id
-            """),
-            {"user_id": user_id},
-        )
+    rows = _fetch_all(
+        text("""
+            SELECT movie_id, rating
+            FROM svd_ratings
+            WHERE user_id = :user_id
+              AND timestamp IS NOT NULL
+            ORDER BY timestamp, movie_id
+        """),
+        {"user_id": user_id},
+    )
 
-        return [
-            (
-                int(row.movie_id),
-                float(row.rating),
-            )
-            for row in result
-        ]
+    return [
+        (int(row.movie_id), float(row.rating))
+        for row in rows
+    ]
 
 
 # ==========================================
@@ -149,31 +200,22 @@ def get_movie_details(movie_ids):
         return {}
 
     sql = text("""
-        SELECT
-            movie_id,
-            title,
-            genres
+        SELECT movie_id, title, genres
         FROM svd_movies
         WHERE movie_id IN :movie_ids
     """).bindparams(
-        __import__(
-            "sqlalchemy"
-        ).bindparam(
-            "movie_ids",
-            expanding=True,
-        )
+        bindparam("movie_ids", expanding=True)
     )
 
-    with SessionLocal() as db:
-        result = db.execute(
-            sql,
-            {"movie_ids": list(movie_ids)},
-        )
+    rows = _fetch_all(
+        sql,
+        {"movie_ids": list(movie_ids)},
+    )
 
-        return {
-            int(row.movie_id): {
-                "title": row.title,
-                "genres": row.genres or "",
-            }
-            for row in result
+    return {
+        int(row.movie_id): {
+            "title": row.title,
+            "genres": row.genres or "",
         }
+        for row in rows
+    }

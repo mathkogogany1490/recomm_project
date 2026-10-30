@@ -1,4 +1,3 @@
-
 import { http } from "../../shared/api/http";
 
 // ==========================================
@@ -15,9 +14,11 @@ export async function getTransformerKpi() {
 // ==========================================
 
 export async function getTransformerRecommendations(userId) {
-    const response = await http.get(
-        `/transformer/recommendations/${encodeURIComponent(userId)}`
-    );
+    const response = await http.get("/transformer/recommendations", {
+        params: {
+            user_id: userId,
+        },
+    });
 
     return response.data;
 }

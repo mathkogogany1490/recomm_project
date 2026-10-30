@@ -1,7 +1,7 @@
-
 services:
+
   # ==========================================
-  # PostgreSQL
+  # 1. PostgreSQL
   # ==========================================
   postgres:
     image: ${POSTGRES_IMAGE}
@@ -29,7 +29,7 @@ services:
     networks: [recomm-network]
 
   # ==========================================
-  # Redis
+  # 2. Redis
   # ==========================================
   redis:
     image: redis:7-alpine
@@ -53,7 +53,7 @@ services:
     networks: [recomm-network]
 
   # ==========================================
-  # FastAPI Backend
+  # 3. FastAPI Backend
   # ==========================================
   backend:
     build:
@@ -66,8 +66,18 @@ services:
     env_file: [.env]
 
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+
+      # Docker 내부 PostgreSQL 주소
+      DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
+
+      # Docker 내부 Redis 주소
+      REDIS_URL: "redis://redis:6379/0"
+
+      PYTHONUNBUFFERED: "1"
 
     expose: ["8000"]
 
@@ -89,7 +99,7 @@ services:
     networks: [recomm-network]
 
   # ==========================================
-  # React + Nginx
+  # 4. React + Nginx
   # ==========================================
   nginx:
     build:
@@ -112,8 +122,10 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+      start_period: 15s
 
     networks: [recomm-network]
+
 
 # ==========================================
 # Docker Volumes
@@ -124,6 +136,7 @@ volumes:
     name: ${POSTGRES_VOLUME}
 
   redis_data:
+
 
 # ==========================================
 # Docker Network

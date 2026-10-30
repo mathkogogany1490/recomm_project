@@ -1,4 +1,3 @@
-
 async function request(url) {
     let response;
 
@@ -35,12 +34,12 @@ async function request(url) {
 
 
 export function fetchMfKpi() {
-    return request("/mf/kpi");
+    return request("/api/mf/kpi");
 }
 
 
 export function fetchMfRecommendations(userId) {
     return request(
-        `/mf/recommendations?user_id=${encodeURIComponent(userId)}`
+        `/api/mf/recommendations?user_id=${encodeURIComponent(userId)}`
     );
 }

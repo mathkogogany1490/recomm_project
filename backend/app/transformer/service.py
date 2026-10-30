@@ -1,665 +1,1037 @@
 
 import argparse
-import os
-import tempfile
+import json
+import logging
+import platform
+import random
+import sys
+import time
+import traceback
 
-from functools import lru_cache
+from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 from tqdm import tqdm
 
-from . import repository
-from .model import MovieTransformer
-
-
-MODEL_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "checkpoint"
-    / "transformer_model"
-    / "transformer_model.pt"
+from app.transformer.repository import (
+    get_counts,
+    get_movie_ids,
+    iter_user_histories,
 )
 
-MAX_LEN = 30
-D_MODEL = 64
-NHEAD = 4
+
+# ==========================================
+# 1. 기본 설정
+# ==========================================
+
+BASE_DIR = Path(__file__).resolve().parents[2]
+
+CHECKPOINT_DIR = (
+    BASE_DIR / "checkpoint" / "transformer_model"
+)
+
+CHECKPOINT_PATH = (
+    CHECKPOINT_DIR / "training_v2.pt"
+)
+
+STATUS_PATH = (
+    CHECKPOINT_DIR / "training_status.json"
+)
+
+EMBED_DIM = 30
+MAX_SEQ_LEN = 30
+NUM_HEADS = 3
 NUM_LAYERS = 2
-BATCH_SIZE = 256
-EPOCHS = 10
-LEARNING_RATE = 0.001
-SEED = 42
+DROPOUT = 0.1
+
+DEFAULT_EPOCHS = 10
+DEFAULT_BATCH_SIZE = 64
+DEFAULT_LR = 0.001
+DB_BATCH_SIZE = 1000
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger("transformer")
 
 
 # ==========================================
-# 1. 장치 자동 선택
+# 2. 화면 출력
 # ==========================================
 
-def get_device():
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        print(
-            "학습 장치: CUDA GPU "
-            f"({torch.cuda.get_device_name(0)})"
-        )
-    elif (
+def show(message=""):
+    tqdm.write(
+        str(message),
+        file=sys.stderr,
+    )
+
+
+def show_step(number, message):
+    show(
+        f"\n[{number}] {message}"
+    )
+
+
+def elapsed_text(seconds):
+    seconds = int(seconds)
+
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    return (
+        f"{hours:02d}:"
+        f"{minutes:02d}:"
+        f"{seconds:02d}"
+    )
+
+
+# ==========================================
+# 3. 학습 상태 JSON 저장
+# ==========================================
+
+def save_status(**kwargs):
+    CHECKPOINT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    payload = {
+        "updated_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        **kwargs,
+    }
+
+    temp_path = STATUS_PATH.with_suffix(".tmp")
+
+    temp_path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    temp_path.replace(STATUS_PATH)
+
+
+# ==========================================
+# 4. CPU / GPU 확인
+# ==========================================
+
+def get_device(force_cpu=False):
+    show_step(
+        "1/8",
+        "CPU / GPU 사용 가능 여부 확인"
+    )
+
+    show(f"운영체제: {platform.platform()}")
+    show(f"Python: {sys.version.split()[0]}")
+    show(f"PyTorch: {torch.__version__}")
+
+    cuda_available = torch.cuda.is_available()
+
+    mps_built = (
+        hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_built()
+    )
+
+    mps_available = (
         hasattr(torch.backends, "mps")
         and torch.backends.mps.is_available()
-    ):
+    )
+
+    show(
+        f"CUDA GPU 사용 가능: {cuda_available}"
+    )
+
+    show(
+        f"Apple MPS 지원 빌드: {mps_built}"
+    )
+
+    show(
+        f"Apple MPS 사용 가능: {mps_available}"
+    )
+
+    if force_cpu:
+        device = torch.device("cpu")
+
+    elif cuda_available:
+        device = torch.device("cuda")
+
+    elif mps_available:
         device = torch.device("mps")
-        print("학습 장치: Apple MPS GPU")
+
     else:
         device = torch.device("cpu")
-        print("학습 장치: CPU")
+
+    if device.type == "cuda":
+        show(
+            "CUDA GPU 이름: "
+            + torch.cuda.get_device_name(0)
+        )
+
+    elif device.type == "mps":
+        show(
+            "Apple Silicon GPU 가속 사용: MPS"
+        )
+
+    else:
+        show(
+            "GPU 가속 미사용: CPU 학습"
+        )
+
+    show(
+        f"실제 학습 장치: {device}"
+    )
 
     return device
 
 
 # ==========================================
-# 2. 시퀀스 데이터 변환
+# 5. Transformer 모델
 # ==========================================
 
-def rating_token(rating):
-    # 0.5 단위 평점 -> 1~10
-    return max(
-        1,
-        min(10, int(round(float(rating) * 2)))
-    )
+class MovieTransformer(nn.Module):
+    def __init__(
+        self,
+        num_movies,
+        embedding_dim=EMBED_DIM,
+        max_seq_len=MAX_SEQ_LEN,
+    ):
+        super().__init__()
+
+        self.max_seq_len = max_seq_len
+
+        self.movie_embedding = nn.Embedding(
+            num_movies + 1,
+            embedding_dim,
+            padding_idx=0,
+        )
+
+        self.position_embedding = nn.Embedding(
+            max_seq_len,
+            embedding_dim,
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=NUM_HEADS,
+            dim_feedforward=embedding_dim * 4,
+            dropout=DROPOUT,
+            batch_first=True,
+        )
+
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=NUM_LAYERS,
+            enable_nested_tensor=False,
+        )
+
+        self.output = nn.Linear(
+            embedding_dim,
+            num_movies + 1,
+        )
+
+    def forward(self, sequences):
+        batch_size, seq_len = sequences.shape
+
+        positions = torch.arange(
+            seq_len,
+            device=sequences.device,
+        ).unsqueeze(0)
+
+        x = (
+            self.movie_embedding(sequences)
+            + self.position_embedding(positions)
+        )
+
+        causal_mask = torch.triu(
+            torch.ones(
+                seq_len,
+                seq_len,
+                device=sequences.device,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
+
+        padding_mask = sequences.eq(0)
+
+        encoded = self.encoder(
+            x,
+            mask=causal_mask,
+            src_key_padding_mask=padding_mask,
+        )
+
+        lengths = (
+            (~padding_mask).sum(dim=1) - 1
+        ).clamp(min=0)
+
+        last_hidden = encoded[
+            torch.arange(
+                batch_size,
+                device=sequences.device,
+            ),
+            lengths,
+        ]
+
+        return self.output(last_hidden)
 
 
-def make_sample(history, target_index, movie_to_idx):
+# ==========================================
+# 6. 학습 데이터 생성
+# ==========================================
+
+def make_sample(history, movie_to_idx):
     """
-    target_index 이전의 영화/평점만 입력.
-    현재 시점 영화의 평점을 예측.
-    """
-    context = history[
-        max(0, target_index - MAX_LEN):target_index
-    ]
+    고객의 마지막 영화를 정답으로 사용합니다.
 
-    movie_seq = [
+    이전 영화들 -> 다음 영화 예측
+
+    반환:
+        (sequence, target)
+    """
+
+    movie_indices = [
         movie_to_idx[movie_id]
-        for movie_id, _ in context
+        for movie_id, rating in history
+        if movie_id in movie_to_idx
     ]
 
-    rating_seq = [
-        rating_token(rating)
-        for _, rating in context
+    if len(movie_indices) < 2:
+        return None
+
+    target = movie_indices[-1]
+
+    sequence = movie_indices[
+        -(MAX_SEQ_LEN + 1):-1
     ]
 
-    # 오른쪽 패딩
-    padding = MAX_LEN - len(movie_seq)
+    sequence = sequence[-MAX_SEQ_LEN:]
 
-    movie_seq += [0] * padding
-    rating_seq += [0] * padding
+    return sequence, target
 
-    target_movie, target_rating = history[
-        target_index
-    ]
 
-    return (
-        movie_seq,
-        rating_seq,
-        movie_to_idx[target_movie],
-        float(target_rating),
+def make_batch(samples, device):
+    sequences, targets = zip(*samples)
+
+    max_len = max(
+        len(sequence)
+        for sequence in sequences
     )
 
-
-def make_tensors(samples, device):
-    movie_seqs = torch.tensor(
-        [row[0] for row in samples],
+    x = torch.zeros(
+        len(samples),
+        max_len,
         dtype=torch.long,
-        device=device,
     )
 
-    rating_seqs = torch.tensor(
-        [row[1] for row in samples],
+    for i, sequence in enumerate(sequences):
+        x[i, :len(sequence)] = torch.tensor(
+            sequence,
+            dtype=torch.long,
+        )
+
+    y = torch.tensor(
+        targets,
         dtype=torch.long,
-        device=device,
     )
 
-    targets = torch.tensor(
-        [row[2] for row in samples],
-        dtype=torch.long,
-        device=device,
-    )
-
-    actuals = torch.tensor(
-        [row[3] for row in samples],
-        dtype=torch.float32,
-        device=device,
-    )
-
-    return movie_seqs, rating_seqs, targets, actuals
+    return x.to(device), y.to(device)
 
 
 # ==========================================
-# 3. 한 배치 학습
+# 7. 배치 학습
 # ==========================================
 
 def train_batch(
     model,
     optimizer,
-    criterion,
     samples,
     device,
 ):
-    movie_seqs, rating_seqs, targets, actuals = (
-        make_tensors(samples, device)
+    x, y = make_batch(samples, device)
+
+    model.train()
+
+    optimizer.zero_grad(
+        set_to_none=True
     )
 
-    optimizer.zero_grad()
+    logits = model(x)
 
-    predicted = model(
-        movie_seqs,
-        rating_seqs,
-        targets,
+    loss = F.cross_entropy(
+        logits,
+        y,
     )
-
-    loss = criterion(predicted, actuals)
 
     loss.backward()
+
+    torch.nn.utils.clip_grad_norm_(
+        model.parameters(),
+        max_norm=1.0,
+    )
+
     optimizer.step()
 
-    return float(loss.item()) * len(samples)
+    predictions = logits.argmax(dim=1)
+
+    correct = (
+        predictions == y
+    ).sum().item()
+
+    return (
+        float(loss.item()),
+        int(correct),
+        len(samples),
+    )
 
 
 # ==========================================
-# 4. 검증
+# 8. 체크포인트 저장
 # ==========================================
 
-def evaluate_model(model, movie_to_idx, device):
-    model.eval()
+def save_checkpoint(
+    model,
+    optimizer,
+    epoch,
+    movie_ids,
+    loss,
+    accuracy,
+):
+    CHECKPOINT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    absolute_sum = 0.0
-    squared_sum = 0.0
-    count = 0
-    samples = []
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "movie_ids": movie_ids,
+        "embedding_dim": EMBED_DIM,
+        "max_seq_len": MAX_SEQ_LEN,
+        "loss": loss,
+        "accuracy": accuracy,
+    }
 
-    def evaluate_batch(batch):
-        nonlocal absolute_sum, squared_sum, count
+    temp_path = CHECKPOINT_PATH.with_suffix(
+        ".tmp"
+    )
 
-        tensors = make_tensors(batch, device)
-        movie_seqs, rating_seqs, targets, actuals = tensors
+    torch.save(
+        checkpoint,
+        temp_path,
+    )
 
-        with torch.no_grad():
-            predicted = model(
-                movie_seqs,
-                rating_seqs,
-                targets,
-            ).clamp(1.0, 5.0)
+    temp_path.replace(
+        CHECKPOINT_PATH
+    )
 
-            # MPS에서 float64를 사용하지 않음
-            # CPU 이동 후 float64로 누적
-            errors = (
-                (predicted - actuals)
-                .detach()
-                .cpu()
-                .double()
-            )
+    show(
+        f"체크포인트 저장 완료: {CHECKPOINT_PATH}"
+    )
 
-            absolute_sum += errors.abs().sum().item()
-            squared_sum += errors.square().sum().item()
-            count += len(batch)
 
-    for _, history in tqdm(
-        repository.iter_user_histories(),
-        desc="검증",
-        unit="user",
-    ):
-        if len(history) < 3:
-            continue
+# ==========================================
+# 9. Transformer 학습
+# ==========================================
 
-        sample = make_sample(
-            history,
-            len(history) - 1,
-            movie_to_idx,
+def train_model(
+    epochs=DEFAULT_EPOCHS,
+    batch_size=DEFAULT_BATCH_SIZE,
+    learning_rate=DEFAULT_LR,
+    resume=False,
+    force_cpu=False,
+):
+    total_start = time.time()
+
+    random.seed(42)
+    torch.manual_seed(42)
+
+    show("=" * 65)
+    show("TRANSFORMER MOVIE RECOMMENDATION TRAINING")
+    show("=" * 65)
+
+    show(
+        f"학습 시작: "
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    show(
+        f"Epoch: {epochs}"
+    )
+
+    show(
+        f"Batch Size: {batch_size}"
+    )
+
+    show(
+        f"Embedding Dimension: {EMBED_DIM}"
+    )
+
+    show(
+        f"Sequence Length: {MAX_SEQ_LEN}"
+    )
+
+    show(
+        f"Learning Rate: {learning_rate}"
+    )
+
+    save_status(
+        state="initializing",
+        epoch=0,
+        total_epochs=epochs,
+        message="학습 환경 확인 중",
+    )
+
+    # --------------------------------------
+    # STEP 1. GPU 확인
+    # --------------------------------------
+
+    device = get_device(force_cpu)
+
+    # --------------------------------------
+    # STEP 2. PostgreSQL 데이터 건수
+    # --------------------------------------
+
+    show_step(
+        "2/8",
+        "PostgreSQL 데이터 건수 조회 중..."
+    )
+
+    query_start = time.time()
+
+    counts = get_counts()
+
+    show(
+        f"평점 건수: {counts['rating_count']:,}"
+    )
+
+    show(
+        f"고객 수: {counts['user_count']:,}"
+    )
+
+    show(
+        f"영화 수: {counts['movie_count']:,}"
+    )
+
+    show(
+        "조회 소요 시간: "
+        + elapsed_text(
+            time.time() - query_start
+        )
+    )
+
+    if counts["user_count"] == 0:
+        raise RuntimeError(
+            "학습할 고객 평점 데이터가 없습니다."
         )
 
-        samples.append(sample)
+    # --------------------------------------
+    # STEP 3. 영화 ID 조회
+    # --------------------------------------
 
-        if len(samples) >= BATCH_SIZE:
-            evaluate_batch(samples)
-            samples.clear()
+    show_step(
+        "3/8",
+        "영화 ID 목록 조회 중..."
+    )
 
-    if samples:
-        evaluate_batch(samples)
-
-    if count == 0:
-        raise ValueError(
-            "검증할 고객 이력이 없습니다."
-        )
-
-    mae = absolute_sum / count
-    mse = squared_sum / count
-    rmse = float(np.sqrt(mse))
-
-    return mae, mse, rmse, count
-
-
-# ==========================================
-# 5. Transformer 학습
-# ==========================================
-
-def train_model():
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-
-    print("\n========== Transformer 학습 ==========")
-
-    counts = repository.get_counts()
-
-    if counts["rating_count"] == 0:
-        raise ValueError(
-            "PostgreSQL에 평점 데이터가 없습니다. "
-            "먼저 import-data를 실행하세요."
-        )
-
-    movie_ids = repository.get_movie_ids()
+    movie_ids = get_movie_ids()
 
     if not movie_ids:
-        raise ValueError("영화 데이터가 없습니다.")
+        raise RuntimeError(
+            "영화 데이터가 없습니다."
+        )
 
-    # 0은 패딩, 실제 영화는 1부터 시작
     movie_to_idx = {
         movie_id: idx + 1
         for idx, movie_id in enumerate(movie_ids)
     }
 
-    print(f"고객: {counts['user_count']:,}명")
-    print(f"영화: {len(movie_ids):,}편")
-    print(f"평점: {counts['rating_count']:,}건")
+    show(
+        f"영화 ID 로딩 완료: {len(movie_ids):,}개"
+    )
 
-    device = get_device()
+    # --------------------------------------
+    # STEP 4. 모델 초기화
+    # --------------------------------------
+
+    show_step(
+        "4/8",
+        "Transformer 모델 생성 중..."
+    )
 
     model = MovieTransformer(
         num_movies=len(movie_ids),
-        d_model=D_MODEL,
-        nhead=NHEAD,
-        num_layers=NUM_LAYERS,
-        max_len=MAX_LEN,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=1e-5,
+        lr=learning_rate,
     )
 
-    criterion = torch.nn.MSELoss()
+    parameter_count = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+    )
 
-    history_metrics = []
+    show(
+        f"모델 파라미터 수: {parameter_count:,}"
+    )
 
-    for epoch in range(EPOCHS):
-        model.train()
+    show(
+        f"모델 실행 장치: "
+        f"{next(model.parameters()).device}"
+    )
 
-        samples = []
-        loss_sum = 0.0
-        train_count = 0
+    start_epoch = 1
 
-        progress = tqdm(
-            repository.iter_user_histories(),
-            total=counts["user_count"],
-            desc=f"Epoch {epoch + 1}/{EPOCHS}",
-            unit="user",
+    # --------------------------------------
+    # STEP 5. 체크포인트 복원
+    # --------------------------------------
+
+    show_step(
+        "5/8",
+        "체크포인트 확인 중..."
+    )
+
+    if resume:
+        if not CHECKPOINT_PATH.exists():
+            raise FileNotFoundError(
+                f"체크포인트가 없습니다: "
+                f"{CHECKPOINT_PATH}"
+            )
+
+        checkpoint = torch.load(
+            CHECKPOINT_PATH,
+            map_location=device,
+            weights_only=True,
         )
 
-        for _, history in progress:
-            if len(history) < 3:
-                continue
+        if checkpoint["movie_ids"] != movie_ids:
+            raise RuntimeError(
+                "체크포인트 영화 목록과 "
+                "현재 DB 영화 목록이 다릅니다."
+            )
 
-            # 마지막 평점은 검증용으로 제외
-            for target_index in range(
-                1, len(history) - 1
-            ):
-                samples.append(
-                    make_sample(
-                        history,
-                        target_index,
-                        movie_to_idx,
-                    )
+        model.load_state_dict(
+            checkpoint["model_state_dict"]
+        )
+
+        optimizer.load_state_dict(
+            checkpoint["optimizer_state_dict"]
+        )
+
+        start_epoch = (
+            int(checkpoint["epoch"]) + 1
+        )
+
+        show(
+            f"체크포인트 복원 완료: "
+            f"Epoch {start_epoch}부터 재개"
+        )
+
+    else:
+        show(
+            "새로운 모델 학습을 시작합니다."
+        )
+
+    if start_epoch > epochs:
+        show(
+            "이미 요청한 Epoch까지 학습되어 있습니다."
+        )
+        return
+
+    # --------------------------------------
+    # STEP 6. 학습 시작
+    # --------------------------------------
+
+    show_step(
+        "6/8",
+        "Transformer 학습 시작"
+    )
+
+    show(
+        f"학습 장치: {device}"
+    )
+
+    show(
+        "학습 지표: Loss / Accuracy / Error Rate"
+    )
+
+    for epoch in range(
+        start_epoch,
+        epochs + 1,
+    ):
+        epoch_start = time.time()
+
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        batch_count = 0
+
+        samples = []
+
+        show("\n" + "-" * 65)
+        show(
+            f"Epoch {epoch}/{epochs} 시작"
+        )
+        show("-" * 65)
+
+        save_status(
+            state="training",
+            epoch=epoch,
+            total_epochs=epochs,
+            device=str(device),
+            message="고객 평점 이력 조회 및 모델 학습 중",
+            processed_users=0,
+            total_users=counts["user_count"],
+        )
+
+        progress = tqdm(
+            iter_user_histories(
+                batch_size=DB_BATCH_SIZE
+            ),
+            total=counts["user_count"],
+            desc=f"Epoch {epoch}/{epochs}",
+            unit="user",
+            dynamic_ncols=True,
+            mininterval=1.0,
+            file=sys.stderr,
+        )
+
+        for user_id, history in progress:
+            sample = make_sample(
+                history,
+                movie_to_idx,
+            )
+
+            if sample is not None:
+                samples.append(sample)
+
+            if len(samples) >= batch_size:
+                loss, correct, count = train_batch(
+                    model,
+                    optimizer,
+                    samples,
+                    device,
                 )
 
-                if len(samples) >= BATCH_SIZE:
-                    batch_loss = train_batch(
-                        model,
-                        optimizer,
-                        criterion,
-                        samples,
-                        device,
+                total_loss += loss * count
+                total_correct += correct
+                total_samples += count
+                batch_count += 1
+
+                samples.clear()
+
+                avg_loss = (
+                    total_loss / total_samples
+                )
+
+                accuracy = (
+                    total_correct
+                    / total_samples
+                    * 100
+                )
+
+                error_rate = (
+                    100 - accuracy
+                )
+
+                progress.set_postfix({
+                    "loss": f"{avg_loss:.4f}",
+                    "acc": f"{accuracy:.2f}%",
+                    "error": f"{error_rate:.2f}%",
+                    "batch": batch_count,
+                    "device": str(device),
+                })
+
+                if batch_count % 20 == 0:
+                    save_status(
+                        state="training",
+                        epoch=epoch,
+                        total_epochs=epochs,
+                        device=str(device),
+                        processed_users=progress.n,
+                        total_users=counts["user_count"],
+                        loss=round(avg_loss, 6),
+                        accuracy=round(accuracy, 3),
+                        error_rate=round(
+                            error_rate, 3
+                        ),
+                        batches=batch_count,
+                        elapsed_seconds=round(
+                            time.time() - epoch_start,
+                            2,
+                        ),
                     )
 
-                    loss_sum += batch_loss
-                    train_count += len(samples)
-                    samples.clear()
+        progress.close()
 
-                    progress.set_postfix(
-                        train_mse=(
-                            f"{loss_sum / train_count:.5f}"
-                        )
-                    )
-
+        # 마지막 배치
         if samples:
-            batch_loss = train_batch(
+            loss, correct, count = train_batch(
                 model,
                 optimizer,
-                criterion,
                 samples,
                 device,
             )
 
-            loss_sum += batch_loss
-            train_count += len(samples)
-            samples.clear()
+            total_loss += loss * count
+            total_correct += correct
+            total_samples += count
+            batch_count += 1
 
-        if train_count == 0:
-            raise ValueError(
-                "학습할 시퀀스가 없습니다. "
-                "평점이 3개 이상인 고객이 필요합니다."
+        if total_samples == 0:
+            raise RuntimeError(
+                "유효한 학습 데이터가 없습니다."
             )
 
-        train_mse = loss_sum / train_count
-
-        mae, mse, rmse, validation_count = (
-            evaluate_model(
-                model,
-                movie_to_idx,
-                device,
-            )
+        avg_loss = (
+            total_loss / total_samples
         )
 
-        history_metrics.append({
-            "epoch": epoch + 1,
-            "train_mse": float(train_mse),
-            "val_mse": float(mse),
-            "val_mae": float(mae),
-            "val_rmse": float(rmse),
-        })
-
-        print(
-            f"Epoch {epoch + 1}/{EPOCHS} | "
-            f"Train MSE={train_mse:.6f} | "
-            f"Val MSE={mse:.6f} | "
-            f"Val MAE={mae:.6f} | "
-            f"Val RMSE={rmse:.6f}"
+        accuracy = (
+            total_correct / total_samples
+            * 100
         )
 
-    # ======================================
-    # 6. 체크포인트 저장
-    # ======================================
+        error_rate = 100 - accuracy
 
-    model.to("cpu")
-
-    checkpoint = {
-        "state_dict": model.state_dict(),
-        "movie_ids": torch.tensor(
-            movie_ids,
-            dtype=torch.long,
-        ),
-        "max_len": MAX_LEN,
-        "d_model": D_MODEL,
-        "nhead": NHEAD,
-        "num_layers": NUM_LAYERS,
-        "epochs": EPOCHS,
-        "mse": float(mse),
-        "mae": float(mae),
-        "rmse": float(rmse),
-        "validation_count": int(validation_count),
-        "counts": counts,
-        "history": history_metrics,
-        "evaluation": "last_rating_per_user",
-    }
-
-    MODEL_PATH.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    with tempfile.NamedTemporaryFile(
-        dir=MODEL_PATH.parent,
-        suffix=".pt",
-        delete=False,
-    ) as temp:
-        temp_path = Path(temp.name)
-
-    try:
-        torch.save(checkpoint, temp_path)
-        os.replace(temp_path, MODEL_PATH)
-    finally:
-        temp_path.unlink(missing_ok=True)
-
-    load_model.cache_clear()
-
-    print("\n========== 학습 완료 ==========")
-    print(f"MSE  : {mse:.6f}")
-    print(f"MAE  : {mae:.6f}")
-    print(f"RMSE : {rmse:.6f}")
-    print(f"저장 : {MODEL_PATH}")
-
-    return checkpoint
-
-
-# ==========================================
-# 7. 체크포인트 로드
-# ==========================================
-
-@lru_cache(maxsize=1)
-def load_model():
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            "Transformer 모델이 없습니다. "
-            "먼저 학습하세요."
+        epoch_seconds = (
+            time.time() - epoch_start
         )
 
-    checkpoint = torch.load(
-        MODEL_PATH,
-        map_location="cpu",
-        weights_only=True,
-    )
-
-    movie_ids = checkpoint["movie_ids"].tolist()
-
-    model = MovieTransformer(
-        num_movies=len(movie_ids),
-        d_model=checkpoint["d_model"],
-        nhead=checkpoint["nhead"],
-        num_layers=checkpoint["num_layers"],
-        max_len=checkpoint["max_len"],
-    )
-
-    model.load_state_dict(
-        checkpoint["state_dict"]
-    )
-    model.eval()
-
-    return {
-        "model": model,
-        "movie_ids": movie_ids,
-        "movie_to_idx": {
-            movie_id: idx + 1
-            for idx, movie_id in enumerate(movie_ids)
-        },
-        "checkpoint": checkpoint,
-    }
-
-
-# ==========================================
-# 8. KPI
-# ==========================================
-
-def get_kpi():
-    data = load_model()
-    checkpoint = data["checkpoint"]
-    counts = checkpoint["counts"]
-
-    return {
-        "mse": round(float(checkpoint["mse"]), 6),
-        "mae": round(float(checkpoint["mae"]), 6),
-        "rmse": round(float(checkpoint["rmse"]), 6),
-        "rating_count": counts["rating_count"],
-        "user_count": counts["user_count"],
-        "movie_count": counts["movie_count"],
-        "epochs": checkpoint["epochs"],
-        "evaluation": checkpoint["evaluation"],
-    }
-
-
-# ==========================================
-# 9. 추천 영화 TOP 5
-# ==========================================
-
-def get_recommendations(user_id):
-    data = load_model()
-
-    model = data["model"]
-    movie_ids = data["movie_ids"]
-    movie_to_idx = data["movie_to_idx"]
-
-    history = repository.get_user_history(
-        user_id
-    )
-
-    if not history:
-        raise ValueError(
-            "평점 이력이 없는 고객입니다."
+        show("\nEpoch 학습 결과")
+        show(
+            f"Epoch: {epoch}/{epochs}"
+        )
+        show(
+            f"Loss: {avg_loss:.6f}"
+        )
+        show(
+            f"Accuracy: {accuracy:.2f}%"
+        )
+        show(
+            f"Error Rate: {error_rate:.2f}%"
+        )
+        show(
+            f"학습 샘플: {total_samples:,}"
+        )
+        show(
+            f"학습 배치: {batch_count:,}"
+        )
+        show(
+            f"소요 시간: "
+            f"{elapsed_text(epoch_seconds)}"
         )
 
-    # 전체 이력에서 본 영화 제외
-    seen_movie_ids = {
-        movie_id
-        for movie_id, _ in history
-    }
-
-    context = history[-MAX_LEN:]
-
-    movie_seq = [
-        movie_to_idx[movie_id]
-        for movie_id, _ in context
-    ]
-
-    rating_seq = [
-        rating_token(rating)
-        for _, rating in context
-    ]
-
-    padding = MAX_LEN - len(movie_seq)
-
-    movie_seq += [0] * padding
-    rating_seq += [0] * padding
-
-    movie_tensor = torch.tensor(
-        [movie_seq],
-        dtype=torch.long,
-    )
-
-    rating_tensor = torch.tensor(
-        [rating_seq],
-        dtype=torch.long,
-    )
-
-    candidates = [
-        movie_id
-        for movie_id in movie_ids
-        if movie_id not in seen_movie_ids
-    ]
-
-    if not candidates:
-        return {
-            "user_id": user_id,
-            "recommendations": [],
-        }
-
-    # 이력은 한 번만 인코딩
-    with torch.no_grad():
-        context_vector = model.encode(
-            movie_tensor,
-            rating_tensor,
+        save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch,
+            movie_ids=movie_ids,
+            loss=avg_loss,
+            accuracy=accuracy,
         )
 
-        scored = []
-
-        for start in range(
-            0, len(candidates), 2048
-        ):
-            chunk = candidates[start:start + 2048]
-
-            indices = torch.tensor(
-                [
-                    movie_to_idx[movie_id]
-                    for movie_id in chunk
-                ],
-                dtype=torch.long,
-            ).unsqueeze(0)
-
-            scores = model.score(
-                context_vector,
-                indices,
-            ).clamp(1.0, 5.0)
-
-            for movie_id, score in zip(
-                chunk,
-                scores.squeeze(0).tolist(),
-            ):
-                scored.append((
-                    movie_id,
-                    float(score),
-                ))
-
-    scored.sort(
-        key=lambda item: (-item[1], item[0])
-    )
-
-    top_five = scored[:5]
-
-    details = repository.get_movie_details(
-        [movie_id for movie_id, _ in top_five]
-    )
-
-    recommendations = []
-
-    for rank, (movie_id, score) in enumerate(
-        top_five,
-        start=1,
-    ):
-        movie = details.get(movie_id, {})
-
-        recommendations.append({
-            "rank": rank,
-            "movie_id": movie_id,
-            "title": movie.get(
-                "title",
-                f"영화 {movie_id}",
+        save_status(
+            state="epoch_completed",
+            epoch=epoch,
+            total_epochs=epochs,
+            device=str(device),
+            processed_users=counts["user_count"],
+            total_users=counts["user_count"],
+            loss=round(avg_loss, 6),
+            accuracy=round(accuracy, 3),
+            error_rate=round(error_rate, 3),
+            batches=batch_count,
+            epoch_seconds=round(
+                epoch_seconds, 2
             ),
-            "genres": movie.get("genres", ""),
-            "predicted_rating": round(score, 4),
-        })
+        )
 
-    return {
-        "user_id": user_id,
-        "recommendations": recommendations,
-    }
+    # --------------------------------------
+    # STEP 7. 학습 완료
+    # --------------------------------------
+
+    show_step(
+        "7/8",
+        "전체 학습 완료"
+    )
+
+    total_elapsed = (
+        time.time() - total_start
+    )
+
+    show(
+        f"총 소요 시간: "
+        f"{elapsed_text(total_elapsed)}"
+    )
+
+    show(
+        f"최종 Loss: {avg_loss:.6f}"
+    )
+
+    show(
+        f"최종 Accuracy: {accuracy:.2f}%"
+    )
+
+    show(
+        f"최종 Error Rate: {error_rate:.2f}%"
+    )
+
+    # --------------------------------------
+    # STEP 8. 종료 상태 저장
+    # --------------------------------------
+
+    show_step(
+        "8/8",
+        "학습 결과 저장 완료"
+    )
+
+    save_status(
+        state="completed",
+        epoch=epochs,
+        total_epochs=epochs,
+        device=str(device),
+        loss=round(avg_loss, 6),
+        accuracy=round(accuracy, 3),
+        error_rate=round(error_rate, 3),
+        total_seconds=round(
+            total_elapsed, 2
+        ),
+    )
+
+    show(
+        f"모델 파일: {CHECKPOINT_PATH}"
+    )
+
+    show(
+        f"상태 파일: {STATUS_PATH}"
+    )
+
+    show("=" * 65)
+    show("TRANSFORMER TRAINING FINISHED")
+    show("=" * 65)
 
 
 # ==========================================
-# 10. CLI
+# 10. 실행 / 오류 처리
 # ==========================================
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Transformer 영화 추천 모델 학습"
+    )
 
     parser.add_argument(
-        "command",
-        choices=["import-data", "train"],
+        "mode",
+        choices=["train"],
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=DEFAULT_EPOCHS,
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+    )
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=DEFAULT_LR,
+    )
+
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="GPU를 사용하지 않고 CPU로 학습",
     )
 
     args = parser.parse_args()
 
-    if args.command == "import-data":
-        repository.create_tables()
-        repository.import_movies()
-        repository.import_ratings()
+    if args.epochs < 1:
+        parser.error(
+            "epochs는 1 이상이어야 합니다."
+        )
 
-    elif args.command == "train":
-        train_model()
+    if args.batch_size < 1:
+        parser.error(
+            "batch-size는 1 이상이어야 합니다."
+        )
+
+    if args.lr <= 0:
+        parser.error(
+            "lr은 0보다 커야 합니다."
+        )
+
+    try:
+        train_model(
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            resume=args.resume,
+            force_cpu=args.cpu,
+        )
+
+    except KeyboardInterrupt:
+        show(
+            "\n[중단] 사용자가 학습을 중단했습니다."
+        )
+
+        save_status(
+            state="interrupted",
+            error="KeyboardInterrupt",
+        )
+
+        raise SystemExit(130)
+
+    except Exception as exc:
+        show("\n" + "=" * 65)
+        show("[ERROR] Transformer 학습 실패")
+        show("=" * 65)
+
+        show(
+            f"오류 종류: {type(exc).__name__}"
+        )
+
+        show(
+            f"오류 내용: {exc}"
+        )
+
+        show("\n상세 오류 위치:")
+
+        traceback.print_exc(
+            file=sys.stderr
+        )
+
+        save_status(
+            state="failed",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

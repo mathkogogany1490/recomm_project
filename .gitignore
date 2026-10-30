@@ -1,8 +1,29 @@
+# secrets
 .env
+.env.*
+!.env.example
+
+# Python
 .venv/
-node_modules/
-.idea/
-.DS_Store
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# GitHub rejects files over 100MB
 backend/app/data/ratings.pkl
+
+# editor and OS
+.idea/
+.vscode/
+.DS_Store
+*.sw?
