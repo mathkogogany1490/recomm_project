@@ -1,0 +1,8 @@
+.env
+.venv/
+node_modules/
+.idea/
+.DS_Store
+__pycache__/
+*.pyc
+backend/app/data/ratings.pkl

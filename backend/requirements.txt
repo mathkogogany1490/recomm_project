@@ -1,0 +1,33 @@
+
+# FastAPI
+fastapi>=0.115
+uvicorn[standard]>=0.34
+
+# PostgreSQL
+SQLAlchemy>=2.0
+psycopg[binary]>=3.2
+
+# Pydantic
+pydantic>=2.10
+pydantic-settings>=2.7
+email-validator>=2.2
+
+# Redis
+redis>=5.2
+
+# JWT
+PyJWT>=2.10
+
+# Password Hash (Argon2)
+pwdlib[argon2]>=0.2
+
+# Data Analysis
+numpy>=2.1
+pandas>=2.2
+scipy>=1.14
+
+# MF Deep Learning (CUDA / MPS / CPU)
+torch>=2.5
+
+# Training Progress
+tqdm>=4.67

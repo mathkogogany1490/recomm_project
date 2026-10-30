@@ -1,0 +1,133 @@
+
+services:
+  # ==========================================
+  # PostgreSQL
+  # ==========================================
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    container_name: recomm-postgres
+    restart: unless-stopped
+
+    env_file: [.env]
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+
+    ports: ["${POSTGRES_PORT}:5432"]
+
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+    networks: [recomm-network]
+
+  # ==========================================
+  # Redis
+  # ==========================================
+  redis:
+    image: redis:7-alpine
+    container_name: recomm-redis
+    restart: unless-stopped
+
+    env_file: [.env]
+
+    command: ["redis-server", "--appendonly", "yes"]
+
+    ports: ["${REDIS_PORT}:6379"]
+
+    volumes: ["redis_data:/data"]
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+    networks: [recomm-network]
+
+  # ==========================================
+  # FastAPI Backend
+  # ==========================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+    container_name: recomm-backend
+    restart: unless-stopped
+
+    env_file: [.env]
+
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+
+    expose: ["8000"]
+
+    volumes: ["./backend/checkpoint:/backend/checkpoint:ro"]
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+    networks: [recomm-network]
+
+  # ==========================================
+  # React + Nginx
+  # ==========================================
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+
+    container_name: recomm-nginx
+    restart: unless-stopped
+
+    env_file: [.env]
+
+    ports: ["${NGINX_PORT}:80"]
+
+    depends_on:
+      backend:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+    networks: [recomm-network]
+
+# ==========================================
+# Docker Volumes
+# ==========================================
+volumes:
+  postgres_data:
+    external: true
+    name: ${POSTGRES_VOLUME}
+
+  redis_data:
+
+# ==========================================
+# Docker Network
+# ==========================================
+networks:
+  recomm-network:
+    driver: bridge
